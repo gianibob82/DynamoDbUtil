@@ -37,6 +37,45 @@ public class DynamoDbUtils
 
             var tablePrefix = _dynamoConfig.TablePrefix;
 
+            var requests = ReturnCreateTableRequests(types, tablePrefix, tableNames);
+
+            List<Task<CreateTableResponse>> createTableTasks = new List<Task<CreateTableResponse>>();
+
+            foreach (var reqCreateTable in requests)
+            {
+                createTableTasks.Add(_oDynamoDBClient.CreateTableAsync(reqCreateTable));
+            }
+
+            await Task.WhenAll(createTableTasks.ToArray());
+
+            var createdTableNames = createTableTasks.Select(t => t.Result.TableDescription.TableName);
+
+            // tables aren't created instantly
+            await WaitUntilTableReadyAsync(createdTableNames.ToArray());
+
+            foreach (var kv in createdTableNames)
+                oSb.AppendLine($"{kv}");
+
+            return oSb;
+        }
+
+        public async Task DropAllTables(string tablePrefix)
+        {
+            var currentTables = await _oDynamoDBClient.ListTablesAsync();
+              var tableNames = currentTables.TableNames.Where(t => t.StartsWith(tablePrefix));
+
+            foreach (var table in tableNames)
+            {
+                DeleteTableRequest deleteTableRequest = new DeleteTableRequest(table);
+                var result = _oDynamoDBClient.DeleteTableAsync(deleteTableRequest);
+                Thread.Sleep(10000);
+            }
+        }
+
+        private IEnumerable< CreateTableRequest> ReturnCreateTableRequests(IEnumerable<Type> types, string tablePrefix, IEnumerable<string> tableNames)
+        {
+            List<CreateTableRequest> tRequests = new List<CreateTableRequest>();
+
             foreach (var tbl in types)
             {
                 var tblName = tablePrefix + tbl.GetCustomAttribute<DynamoDBTableAttribute>().TableName;
@@ -56,6 +95,7 @@ public class DynamoDbUtils
 
                     if (hashKeyProperty != null)
                     {
+
                         string hashKeyName = hashKeyProperty.Name;
                         if (hashKeyProperty.GetCustomAttribute<DynamoDBHashKeyAttribute>().AttributeName != null)
                             hashKeyName = hashKeyProperty.GetCustomAttribute<DynamoDBHashKeyAttribute>().AttributeName;
@@ -100,7 +140,7 @@ public class DynamoDbUtils
                             }
                         }
 
-                        // adding local secondary indexes
+                        // adding global secondary indexes
                         var globalIndexes = tbl.GetProperties().Where(p => p.GetCustomAttribute<DynamoDBGlobalSecondaryIndexHashKeyAttribute>() != null);
                         if (globalIndexes.Count() > 0)
                         {
@@ -136,43 +176,21 @@ public class DynamoDbUtils
                                     IndexName = thisGlobalIndexName,
                                     KeySchema = globalKeySchema,
                                     Projection = projection,
-                                     ProvisionedThroughput = new ProvisionedThroughput(1,1)
+                                    ProvisionedThroughput = new ProvisionedThroughput(1, 1)
                                 };
 
                                 reqCreateTable.GlobalSecondaryIndexes.Add(globalSecondaryIndex);
                             }
                         }
 
-                        var response = await _oDynamoDBClient.CreateTableAsync(reqCreateTable);
-
-                        // tables aren't created instantly
-                        await WaitUntilTableReadyAsync(reqCreateTable.TableName);
-
-                        foreach (var kv in response.ResponseMetadata.Metadata)
-                            oSb.AppendLine($"{kv.Key} {kv.Value}");
-                    }
-                    else
-                    {
-                        oSb.AppendLine($"{tblName} table has no hash key property");
+                        tRequests.Add(reqCreateTable);
                     }
                 }
             }
-            return oSb;
+
+            return tRequests;
         }
-
-        public async Task DropAllTables(string tablePrefix)
-        {
-            var currentTables = await _oDynamoDBClient.ListTablesAsync();
-              var tableNames = currentTables.TableNames.Where(t => t.StartsWith(tablePrefix));
-
-            foreach (var table in tableNames)
-            {
-                DeleteTableRequest deleteTableRequest = new DeleteTableRequest(table);
-                var result = _oDynamoDBClient.DeleteTableAsync(deleteTableRequest);
-                Thread.Sleep(10000);
-            }
-        }
-
+        
         private List<Type> GetTypesWithDynamoTableAttribute(Assembly assembly)
         {
             List<Type> types = new List<Type>();
@@ -196,30 +214,36 @@ public class DynamoDbUtils
                 return new AttributeDefinition(propertyName, ScalarAttributeType.N);
         }
 
-        private async Task WaitUntilTableReadyAsync(string tableName)
+        private async Task WaitUntilTableReadyAsync(params string[] tableNames)
         {
-            string status = null;
+            bool completed = false;
+
+            List<Task<DescribeTableResponse>> describeTasks = null;
+
+            IEnumerable<DescribeTableRequest> describeTableRequests = tableNames.Select(t => new DescribeTableRequest { TableName = t });
+
             // Let us wait until table is created. Call DescribeTable.
             do
             {
+                describeTasks = new List<Task<DescribeTableResponse>>();
+
                 System.Threading.Thread.Sleep(5000); // Wait 5 seconds.
                 try
                 {
-                    var res = await _oDynamoDBClient.DescribeTableAsync(new DescribeTableRequest
+                    foreach (var req in describeTableRequests)
                     {
-                        TableName = tableName
-                    });
+                        describeTasks.Add(_oDynamoDBClient.DescribeTableAsync(req));
+                    }
 
-                    Console.WriteLine("Table name: {0}, status: {1}",
-                              res.Table.TableName,
-                              res.Table.TableStatus);
-                    status = res.Table.TableStatus;
+                    await Task.WhenAll(describeTasks.ToArray());
+
+                    completed = describeTasks.All(t => t.Result.Table.TableStatus == "ACTIVE");
                 }
                 catch (ResourceNotFoundException)
                 {
                     // DescribeTable is eventually consistent. So you might
                     // get resource not found. So we handle the potential exception.
                 }
-            } while (status != "ACTIVE");
+            } while (!completed);
         }
     }
